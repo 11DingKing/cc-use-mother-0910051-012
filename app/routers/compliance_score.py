@@ -11,13 +11,15 @@ from ..models import (
     QualificationType, InstitutionAuthorizedProcedure, ActualProcedureRecord,
     ViolationClue, ClueType, ClueStatus,
     ComplianceScore, ComplianceGrade, ScoreItem, InspectionFrequency,
-    SupervisionPlan, PlanStatus, CluePriority
+    SupervisionPlan, PlanStatus, CluePriority,
+    RectificationCase, RectificationCaseClue
 )
 from .. import schemas
 from ..compliance_utils import (
     check_institution_license_valid,
     count_unlicensed_practitioners
 )
+from ..rectification_service import get_active_adjustment_map
 
 router = APIRouter()
 
@@ -71,6 +73,33 @@ def get_inspection_frequency(grade: ComplianceGrade) -> InspectionFrequency:
     return GRADE_FREQUENCY.get(grade, InspectionFrequency.ANNUAL)
 
 
+def _linked_clue_ids(db: Session, institution_id: int) -> set:
+    """已纳入整改案件的线索ID：其评分影响走整改台账，原始口径不再重复计算。"""
+    rows = db.query(RectificationCaseClue.clue_id).join(
+        RectificationCase, RectificationCase.id == RectificationCaseClue.case_id
+    ).filter(
+        RectificationCase.institution_id == institution_id
+    ).all()
+    return {row[0] for row in rows}
+
+
+def _clamp_score(value: float, item: ScoreItem) -> float:
+    return max(0.0, min(MAX_SCORES[item], round(value, 2)))
+
+
+# 台账调整类型中文说明
+_ADJUSTMENT_REASON = {
+    "VIOLATION_PENALTY": "违规扣分",
+    "DISMISS_VOID": "撤案恢复",
+    "RESTORE": "整改复核恢复",
+    "RECURRENCE_PENALTY": "问题复发重新扣分",
+    "REVOKE_APPROVAL_PENALTY": "撤销错误通过、重新扣分",
+    "REVOKE_RECUR_RESTORE": "撤销复发认定、返还扣分",
+    "OVERDUE_PENALTY": "整改逾期升级扣分",
+    "OVERDUE_VOID": "逾期扣分冲回",
+}
+
+
 def calculate_compliance_score(
     institution_id: int, db: Session, scoring_period: Optional[str] = None
 ) -> schemas.ScoreCalculationResult:
@@ -80,6 +109,11 @@ def calculate_compliance_score(
 
     deductions: List[schemas.ScoreDeduction] = []
     scores = {item: max_score for item, max_score in MAX_SCORES.items()}
+
+    # 已纳入整改案件的线索走评分台账（扣分/恢复/逾期/撤销均有独立记录），
+    # 未立案线索沿用原始统计口径，二者互斥，避免同一问题重复扣分
+    linked_clue_ids = _linked_clue_ids(db, institution_id)
+    adjustment_map = get_active_adjustment_map(db, institution_id)
 
     has_valid_license, license_msg, valid_license = check_institution_license_valid(
         db, institution_id
@@ -159,7 +193,8 @@ def calculate_compliance_score(
     quick_training_clues = db.query(ViolationClue).filter(
         ViolationClue.institution_id == institution_id,
         ViolationClue.clue_type == ClueType.QUICK_TRAINING,
-        ViolationClue.status.in_([ClueStatus.VERIFIED, ClueStatus.ASSIGNED, ClueStatus.PENDING])
+        ViolationClue.status.in_([ClueStatus.VERIFIED, ClueStatus.ASSIGNED, ClueStatus.PENDING]),
+        ~ViolationClue.id.in_(linked_clue_ids)
     ).all()
     verified_quick = [c for c in quick_training_clues if c.status == ClueStatus.VERIFIED]
     pending_quick = [c for c in quick_training_clues if c.status != ClueStatus.VERIFIED]
@@ -186,7 +221,8 @@ def calculate_compliance_score(
     false_ad_clues = db.query(ViolationClue).filter(
         ViolationClue.institution_id == institution_id,
         ViolationClue.clue_type == ClueType.FALSE_ADVERTISEMENT,
-        ViolationClue.status.in_([ClueStatus.VERIFIED, ClueStatus.ASSIGNED, ClueStatus.PENDING])
+        ViolationClue.status.in_([ClueStatus.VERIFIED, ClueStatus.ASSIGNED, ClueStatus.PENDING]),
+        ~ViolationClue.id.in_(linked_clue_ids)
     ).all()
     verified_ad = [c for c in false_ad_clues if c.status == ClueStatus.VERIFIED]
     pending_ad = [c for c in false_ad_clues if c.status != ClueStatus.VERIFIED]
@@ -212,7 +248,8 @@ def calculate_compliance_score(
 
     verified_violations = db.query(ViolationClue).filter(
         ViolationClue.institution_id == institution_id,
-        ViolationClue.status == ClueStatus.VERIFIED
+        ViolationClue.status == ClueStatus.VERIFIED,
+        ~ViolationClue.id.in_(linked_clue_ids)
     ).count()
 
     if verified_violations > 0:
@@ -233,6 +270,26 @@ def calculate_compliance_score(
         ))
 
     total_score = round(sum(scores.values()), 2)
+
+    # 叠加整改评分台账净额（违规扣分/整改恢复/复发/撤销/逾期均以独立调整记录落账）
+    if adjustment_map:
+        for item, net_delta in adjustment_map.items():
+            if item not in scores or abs(net_delta) < 0.001:
+                continue
+            before = scores[item]
+            after = _clamp_score(before + net_delta, item)
+            scores[item] = after
+            actual_delta = round(after - before, 2)
+            if abs(actual_delta) > 0.001:
+                deductions.append(schemas.ScoreDeduction(
+                    item=item,
+                    max_score=MAX_SCORES[item],
+                    actual_score=after,
+                    deduction=-actual_delta,
+                    reason="整改案件台账净额调整（违规/整改/复发/逾期，详见评分调整记录）"
+                ))
+        total_score = round(sum(scores.values()), 2)
+
     grade = get_grade(total_score)
     inspection_frequency = get_inspection_frequency(grade)
 

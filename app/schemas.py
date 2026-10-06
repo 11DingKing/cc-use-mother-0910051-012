@@ -4,7 +4,9 @@ from typing import Optional, List
 from .models import (
     InstitutionType, ProcedureCategory, SurgeryLevel,
     QualificationType, ClueType, ClueStatus, CluePriority,
-    ComplianceGrade, ScoreItem, InspectionFrequency, PlanStatus
+    ComplianceGrade, ScoreItem, InspectionFrequency, PlanStatus,
+    RectificationCaseStatus, RequirementStatus, ReviewDecision,
+    ScoreAdjustmentType
 )
 
 
@@ -482,3 +484,214 @@ class ComplianceGradeDistribution(BaseModel):
     count: int
     percentage: float
     score_range: str
+
+
+# ==================== 整改案件 ====================
+
+class RectificationRequirementCreate(BaseModel):
+    content: str
+    acceptance_criteria: Optional[str] = None
+    due_date: date
+
+
+class RectificationCaseCreate(BaseModel):
+    clue_id: int
+    title: Optional[str] = None
+    priority: CluePriority = CluePriority.HIGH
+    requirements: List[RectificationRequirementCreate]
+
+
+class RectificationCaseUpdate(BaseModel):
+    title: Optional[str] = None
+    priority: Optional[CluePriority] = None
+
+
+class RectificationClueLink(BaseModel):
+    clue_id: int
+    link_remark: Optional[str] = None
+
+
+class RectificationEvidenceCreate(BaseModel):
+    file_name: str
+    file_url: Optional[str] = None
+    file_hash: Optional[str] = None
+    content_text: Optional[str] = None
+    submit_remark: Optional[str] = None
+    submitted_by: Optional[str] = None
+
+
+class RectificationReviewCreate(BaseModel):
+    decision: ReviewDecision
+    comment: str
+    reviewer: str
+    evidence_version: Optional[int] = None
+    # 部分通过时显式指定每条要求的决定
+    item_decisions: Optional[List["RequirementReviewItem"]] = None
+
+
+class RequirementReviewItem(BaseModel):
+    requirement_id: int
+    decision: ReviewDecision
+    comment: Optional[str] = None
+
+
+class RectificationReviewRevoke(BaseModel):
+    revoked_by: str
+    reason: str
+
+
+class RectificationEvidence(BaseModel):
+    id: int
+    requirement_id: int
+    version_no: int
+    file_name: str
+    file_url: Optional[str] = None
+    file_hash: Optional[str] = None
+    content_text: Optional[str] = None
+    submit_remark: Optional[str] = None
+    submitted_by: Optional[str] = None
+    submitted_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class RectificationReview(BaseModel):
+    id: int
+    case_id: int
+    requirement_id: Optional[int] = None
+    decision: ReviewDecision
+    reviewer: str
+    comment: Optional[str] = None
+    evidence_version: Optional[int] = None
+    reviewed_at: datetime
+    is_active: bool
+    revoked_at: Optional[datetime] = None
+    revoked_by: Optional[str] = None
+    revoke_reason: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class RectificationRequirement(BaseModel):
+    id: int
+    case_id: int
+    content: str
+    acceptance_criteria: Optional[str] = None
+    due_date: date
+    status: RequirementStatus
+    effective_decision: Optional[ReviewDecision] = None
+    penalty_score: float
+    approved_at: Optional[datetime] = None
+    approved_by: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class RectificationRequirementDetail(RectificationRequirement):
+    evidence_versions: List[RectificationEvidence] = []
+    latest_evidence_version: Optional[int] = None
+    reviews: List[RectificationReview] = []
+
+
+class RectificationCaseClue(BaseModel):
+    id: int
+    case_id: int
+    clue_id: int
+    linked_at: datetime
+    link_remark: Optional[str] = None
+    clue: Optional[ViolationClue] = None
+
+    class Config:
+        from_attributes = True
+
+
+class RectificationCase(BaseModel):
+    id: int
+    case_no: str
+    title: str
+    clue_id: int
+    institution_id: int
+    status: RectificationCaseStatus
+    priority: CluePriority
+    score_item: ScoreItem
+    violation_summary: Optional[str] = None
+    problem_signature: str
+    penalty_score: float
+    escalated: bool
+    escalated_at: Optional[datetime] = None
+    closed_at: Optional[datetime] = None
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class RectificationCaseDetail(RectificationCase):
+    clue: Optional[ViolationClue] = None
+    institution: Optional[Institution] = None
+    requirements: List[RectificationRequirementDetail] = []
+    reviews: List[RectificationReview] = []
+    clue_links: List[RectificationCaseClue] = []
+    linked_clue_count: int = 1
+
+
+class RectificationCaseSummary(BaseModel):
+    case_id: int
+    case_no: str
+    title: str
+    institution_id: int
+    status: RectificationCaseStatus
+    priority: CluePriority
+    score_item: ScoreItem
+    penalty_score: float
+    escalated: bool
+    total_requirements: int
+    approved_requirements: int
+    pending_requirements: int
+    recurred_requirements: int
+    overdue_count: int
+    created_at: datetime
+
+
+class EscalationResult(BaseModel):
+    scanned_cases: int
+    overdue_requirements: int
+    escalated_cases: int
+    escalated_case_ids: List[int] = []
+
+
+class ScoreAdjustment(BaseModel):
+    id: int
+    institution_id: int
+    adjustment_type: ScoreAdjustmentType
+    score_item: ScoreItem
+    score_delta: float
+    problem_signature: Optional[str] = None
+    case_id: Optional[int] = None
+    requirement_id: Optional[int] = None
+    clue_id: Optional[int] = None
+    review_id: Optional[int] = None
+    related_adjustment_id: Optional[int] = None
+    reason: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class InstitutionComplianceTraceability(BaseModel):
+    institution_id: int
+    institution_name: str
+    latest_score: Optional[ComplianceScoreDetail] = None
+    score_history: List[ComplianceScoreDetail] = []
+    adjustments: List[ScoreAdjustment] = []
+    rectification_cases: List[RectificationCaseDetail] = []
+    verified_clues: List[ViolationClue] = []
+
+
+RectificationReviewCreate.model_rebuild()
