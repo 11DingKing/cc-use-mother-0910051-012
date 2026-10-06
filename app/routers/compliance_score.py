@@ -7,43 +7,20 @@ import json
 
 from ..database import get_db
 from ..models import (
-    Institution, InstitutionLicense, Practitioner, PractitionerQualification,
-    QualificationType, InstitutionAuthorizedProcedure, ActualProcedureRecord,
-    ViolationClue, ClueType, ClueStatus,
-    ComplianceScore, ComplianceGrade, ScoreItem, InspectionFrequency,
-    SupervisionPlan, PlanStatus, CluePriority
+    Institution, ComplianceScore, ComplianceGrade, ScoreItem,
+    InspectionFrequency, SupervisionPlan, PlanStatus, CluePriority,
 )
 from .. import schemas
-from ..compliance_utils import (
-    check_institution_license_valid,
-    count_unlicensed_practitioners
+from .. import score_service
+from ..score_service import (
+    MAX_SCORES, GRADE_RANGES, GRADE_NAMES,
+    get_grade, get_inspection_frequency,
+    calculate_compliance_score,
 )
 
 router = APIRouter()
 
-MAX_SCORES = {
-    ScoreItem.LICENSE_VALID: 15.0,
-    ScoreItem.LICENSE_COMPLETE: 10.0,
-    ScoreItem.NO_OVER_RANGE: 20.0,
-    ScoreItem.ALL_STAFF_LICENSED: 20.0,
-    ScoreItem.NO_QUICK_TRAINING: 15.0,
-    ScoreItem.NO_FALSE_ADVERTISEMENT: 10.0,
-    ScoreItem.NO_VERIFIED_VIOLATION: 10.0,
-}
-
-GRADE_RANGES = [
-    (ComplianceGrade.EXCELLENT, 90.0, 100.0),
-    (ComplianceGrade.GOOD, 75.0, 89.99),
-    (ComplianceGrade.FAIR, 60.0, 74.99),
-    (ComplianceGrade.POOR, 0.0, 59.99),
-]
-
-GRADE_FREQUENCY = {
-    ComplianceGrade.EXCELLENT: InspectionFrequency.EXTENDED,
-    ComplianceGrade.GOOD: InspectionFrequency.ANNUAL,
-    ComplianceGrade.FAIR: InspectionFrequency.BIANNUAL,
-    ComplianceGrade.POOR: InspectionFrequency.QUARTERLY,
-}
+GRADE_FREQUENCY = score_service.GRADE_FREQUENCY
 
 FREQUENCY_MONTHS = {
     InspectionFrequency.QUARTERLY: 3,
@@ -51,199 +28,6 @@ FREQUENCY_MONTHS = {
     InspectionFrequency.ANNUAL: 12,
     InspectionFrequency.EXTENDED: 24,
 }
-
-GRADE_NAMES = {
-    ComplianceGrade.EXCELLENT: "优秀",
-    ComplianceGrade.GOOD: "良好",
-    ComplianceGrade.FAIR: "合格",
-    ComplianceGrade.POOR: "不合格",
-}
-
-
-def get_grade(total_score: float) -> ComplianceGrade:
-    for grade, min_score, max_score in GRADE_RANGES:
-        if min_score <= total_score <= max_score:
-            return grade
-    return ComplianceGrade.POOR
-
-
-def get_inspection_frequency(grade: ComplianceGrade) -> InspectionFrequency:
-    return GRADE_FREQUENCY.get(grade, InspectionFrequency.ANNUAL)
-
-
-def calculate_compliance_score(
-    institution_id: int, db: Session, scoring_period: Optional[str] = None
-) -> schemas.ScoreCalculationResult:
-    institution = db.query(Institution).filter(Institution.id == institution_id).first()
-    if not institution:
-        raise HTTPException(status_code=404, detail=f"机构 {institution_id} 不存在")
-
-    deductions: List[schemas.ScoreDeduction] = []
-    scores = {item: max_score for item, max_score in MAX_SCORES.items()}
-
-    has_valid_license, license_msg, valid_license = check_institution_license_valid(
-        db, institution_id
-    )
-    if not has_valid_license:
-        scores[ScoreItem.LICENSE_VALID] = 0.0
-        deductions.append(schemas.ScoreDeduction(
-            item=ScoreItem.LICENSE_VALID,
-            max_score=MAX_SCORES[ScoreItem.LICENSE_VALID],
-            actual_score=0.0,
-            deduction=MAX_SCORES[ScoreItem.LICENSE_VALID],
-            reason=license_msg or "无有效医疗机构执业许可证或许可证已过期"
-        ))
-
-    if valid_license and valid_license.is_valid:
-        if not valid_license.approved_surgeries:
-            scores[ScoreItem.LICENSE_COMPLETE] = MAX_SCORES[ScoreItem.LICENSE_COMPLETE] * 0.5
-            deductions.append(schemas.ScoreDeduction(
-                item=ScoreItem.LICENSE_COMPLETE,
-                max_score=MAX_SCORES[ScoreItem.LICENSE_COMPLETE],
-                actual_score=scores[ScoreItem.LICENSE_COMPLETE],
-                deduction=MAX_SCORES[ScoreItem.LICENSE_COMPLETE] * 0.5,
-                reason="许可证未明确核准诊疗科目范围"
-            ))
-
-    over_range_records = db.query(ActualProcedureRecord).filter(
-        ActualProcedureRecord.institution_id == institution_id,
-        ActualProcedureRecord.is_over_range == True
-    ).all()
-    if over_range_records:
-        over_range_count = len(over_range_records)
-        total_records = db.query(ActualProcedureRecord).filter(
-            ActualProcedureRecord.institution_id == institution_id
-        ).count()
-        over_range_ratio = over_range_count / total_records if total_records > 0 else 1.0
-
-        if over_range_ratio >= 0.5:
-            scores[ScoreItem.NO_OVER_RANGE] = 0.0
-        elif over_range_ratio >= 0.3:
-            scores[ScoreItem.NO_OVER_RANGE] = MAX_SCORES[ScoreItem.NO_OVER_RANGE] * 0.3
-        elif over_range_ratio >= 0.1:
-            scores[ScoreItem.NO_OVER_RANGE] = MAX_SCORES[ScoreItem.NO_OVER_RANGE] * 0.6
-
-        deduction = MAX_SCORES[ScoreItem.NO_OVER_RANGE] - scores[ScoreItem.NO_OVER_RANGE]
-        if deduction > 0:
-            deductions.append(schemas.ScoreDeduction(
-                item=ScoreItem.NO_OVER_RANGE,
-                max_score=MAX_SCORES[ScoreItem.NO_OVER_RANGE],
-                actual_score=scores[ScoreItem.NO_OVER_RANGE],
-                deduction=deduction,
-                reason=f"存在 {over_range_count} 条超范围执业记录，占比 {over_range_ratio:.1%}"
-            ))
-
-    unlicensed_count, total_practitioners = count_unlicensed_practitioners(
-        db, institution_id
-    )
-
-    if total_practitioners > 0:
-        unlicensed_ratio = unlicensed_count / total_practitioners
-        if unlicensed_ratio >= 0.5:
-            scores[ScoreItem.ALL_STAFF_LICENSED] = 0.0
-        elif unlicensed_ratio >= 0.3:
-            scores[ScoreItem.ALL_STAFF_LICENSED] = MAX_SCORES[ScoreItem.ALL_STAFF_LICENSED] * 0.3
-        elif unlicensed_ratio > 0:
-            scores[ScoreItem.ALL_STAFF_LICENSED] = MAX_SCORES[ScoreItem.ALL_STAFF_LICENSED] * 0.6
-
-        deduction = MAX_SCORES[ScoreItem.ALL_STAFF_LICENSED] - scores[ScoreItem.ALL_STAFF_LICENSED]
-        if deduction > 0:
-            deductions.append(schemas.ScoreDeduction(
-                item=ScoreItem.ALL_STAFF_LICENSED,
-                max_score=MAX_SCORES[ScoreItem.ALL_STAFF_LICENSED],
-                actual_score=scores[ScoreItem.ALL_STAFF_LICENSED],
-                deduction=deduction,
-                reason=f"{unlicensed_count}/{total_practitioners} 名从业人员无有效执业证书，占比 {unlicensed_ratio:.1%}"
-            ))
-
-    quick_training_clues = db.query(ViolationClue).filter(
-        ViolationClue.institution_id == institution_id,
-        ViolationClue.clue_type == ClueType.QUICK_TRAINING,
-        ViolationClue.status.in_([ClueStatus.VERIFIED, ClueStatus.ASSIGNED, ClueStatus.PENDING])
-    ).all()
-    verified_quick = [c for c in quick_training_clues if c.status == ClueStatus.VERIFIED]
-    pending_quick = [c for c in quick_training_clues if c.status != ClueStatus.VERIFIED]
-
-    if verified_quick:
-        scores[ScoreItem.NO_QUICK_TRAINING] = 0.0
-        deductions.append(schemas.ScoreDeduction(
-            item=ScoreItem.NO_QUICK_TRAINING,
-            max_score=MAX_SCORES[ScoreItem.NO_QUICK_TRAINING],
-            actual_score=0.0,
-            deduction=MAX_SCORES[ScoreItem.NO_QUICK_TRAINING],
-            reason=f"已核实 {len(verified_quick)} 条速成班培训线索"
-        ))
-    elif pending_quick:
-        scores[ScoreItem.NO_QUICK_TRAINING] = MAX_SCORES[ScoreItem.NO_QUICK_TRAINING] * 0.5
-        deductions.append(schemas.ScoreDeduction(
-            item=ScoreItem.NO_QUICK_TRAINING,
-            max_score=MAX_SCORES[ScoreItem.NO_QUICK_TRAINING],
-            actual_score=scores[ScoreItem.NO_QUICK_TRAINING],
-            deduction=MAX_SCORES[ScoreItem.NO_QUICK_TRAINING] * 0.5,
-            reason=f"存在 {len(pending_quick)} 条待核实的速成班培训线索"
-        ))
-
-    false_ad_clues = db.query(ViolationClue).filter(
-        ViolationClue.institution_id == institution_id,
-        ViolationClue.clue_type == ClueType.FALSE_ADVERTISEMENT,
-        ViolationClue.status.in_([ClueStatus.VERIFIED, ClueStatus.ASSIGNED, ClueStatus.PENDING])
-    ).all()
-    verified_ad = [c for c in false_ad_clues if c.status == ClueStatus.VERIFIED]
-    pending_ad = [c for c in false_ad_clues if c.status != ClueStatus.VERIFIED]
-
-    if verified_ad:
-        scores[ScoreItem.NO_FALSE_ADVERTISEMENT] = 0.0
-        deductions.append(schemas.ScoreDeduction(
-            item=ScoreItem.NO_FALSE_ADVERTISEMENT,
-            max_score=MAX_SCORES[ScoreItem.NO_FALSE_ADVERTISEMENT],
-            actual_score=0.0,
-            deduction=MAX_SCORES[ScoreItem.NO_FALSE_ADVERTISEMENT],
-            reason=f"已核实 {len(verified_ad)} 条虚假宣传线索"
-        ))
-    elif pending_ad:
-        scores[ScoreItem.NO_FALSE_ADVERTISEMENT] = MAX_SCORES[ScoreItem.NO_FALSE_ADVERTISEMENT] * 0.5
-        deductions.append(schemas.ScoreDeduction(
-            item=ScoreItem.NO_FALSE_ADVERTISEMENT,
-            max_score=MAX_SCORES[ScoreItem.NO_FALSE_ADVERTISEMENT],
-            actual_score=scores[ScoreItem.NO_FALSE_ADVERTISEMENT],
-            deduction=MAX_SCORES[ScoreItem.NO_FALSE_ADVERTISEMENT] * 0.5,
-            reason=f"存在 {len(pending_ad)} 条待核实的虚假宣传线索"
-        ))
-
-    verified_violations = db.query(ViolationClue).filter(
-        ViolationClue.institution_id == institution_id,
-        ViolationClue.status == ClueStatus.VERIFIED
-    ).count()
-
-    if verified_violations > 0:
-        if verified_violations >= 3:
-            scores[ScoreItem.NO_VERIFIED_VIOLATION] = 0.0
-        elif verified_violations >= 2:
-            scores[ScoreItem.NO_VERIFIED_VIOLATION] = MAX_SCORES[ScoreItem.NO_VERIFIED_VIOLATION] * 0.3
-        else:
-            scores[ScoreItem.NO_VERIFIED_VIOLATION] = MAX_SCORES[ScoreItem.NO_VERIFIED_VIOLATION] * 0.6
-
-        deduction = MAX_SCORES[ScoreItem.NO_VERIFIED_VIOLATION] - scores[ScoreItem.NO_VERIFIED_VIOLATION]
-        deductions.append(schemas.ScoreDeduction(
-            item=ScoreItem.NO_VERIFIED_VIOLATION,
-            max_score=MAX_SCORES[ScoreItem.NO_VERIFIED_VIOLATION],
-            actual_score=scores[ScoreItem.NO_VERIFIED_VIOLATION],
-            deduction=deduction,
-            reason=f"存在 {verified_violations} 条已核实的违规记录"
-        ))
-
-    total_score = round(sum(scores.values()), 2)
-    grade = get_grade(total_score)
-    inspection_frequency = get_inspection_frequency(grade)
-
-    return schemas.ScoreCalculationResult(
-        institution_id=institution_id,
-        institution_name=institution.name,
-        total_score=total_score,
-        grade=grade,
-        inspection_frequency=inspection_frequency,
-        deductions=deductions
-    )
 
 
 def save_compliance_score(

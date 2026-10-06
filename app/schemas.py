@@ -4,7 +4,9 @@ from typing import Optional, List
 from .models import (
     InstitutionType, ProcedureCategory, SurgeryLevel,
     QualificationType, ClueType, ClueStatus, CluePriority,
-    ComplianceGrade, ScoreItem, InspectionFrequency, PlanStatus
+    ComplianceGrade, ScoreItem, InspectionFrequency, PlanStatus,
+    RectificationCaseStatus, RectificationItemStatus, RectificationDecision,
+    ReviewResult, ScoreAdjustmentType, CaseEventType
 )
 
 
@@ -482,3 +484,224 @@ class ComplianceGradeDistribution(BaseModel):
     count: int
     percentage: float
     score_range: str
+
+
+# ==================== 整改案件 ====================
+
+class RequirementSpec(BaseModel):
+    """一条可验收的整改要求。"""
+    requirement: str
+    acceptance_criteria: Optional[str] = None
+    due_date: Optional[date] = None
+
+
+class ViolationSpec(BaseModel):
+    """一项违规结论及其拆出的整改要求；violation_key 缺省取源线索自然键。"""
+    violation_key: Optional[str] = None
+    violation_summary: Optional[str] = None
+    requirements: List[RequirementSpec]
+
+
+class RectificationCaseCreate(BaseModel):
+    clue_id: int
+    title: str
+    score_item: ScoreItem
+    due_date: date
+    violations: List[ViolationSpec]
+    created_by: Optional[str] = None
+
+
+class ClueLinkRequest(BaseModel):
+    """把另一条线索引用到案件内已有的违规结论上（不重复扣分）。"""
+    clue_id: int
+    violation_key: str
+    violation_summary: Optional[str] = None
+
+
+class EvidenceSubmit(BaseModel):
+    material_name: str
+    file_ref: Optional[str] = None
+    content: Optional[str] = None
+    submitted_by: Optional[str] = None
+
+
+class ItemReviewSpec(BaseModel):
+    item_id: int
+    result: ReviewResult
+    comment: Optional[str] = None
+    evidence_id: Optional[int] = None
+
+
+class ReviewCreate(BaseModel):
+    decision: RectificationDecision
+    reviewer: str
+    comment: Optional[str] = None
+    item_results: List[ItemReviewSpec] = []
+
+
+class ReviewRevoke(BaseModel):
+    reason: str
+    reviewer: Optional[str] = None
+
+
+class OverdueEscalationResult(BaseModel):
+    escalated_cases: List[int] = []
+    penalized_cases: List[int] = []
+    checked_at: datetime
+
+
+class RectificationEvidenceOut(BaseModel):
+    id: int
+    item_id: int
+    version: int
+    material_name: str
+    file_ref: Optional[str] = None
+    content: Optional[str] = None
+    submitted_by: Optional[str] = None
+    submitted_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class RectificationItemReviewOut(BaseModel):
+    id: int
+    review_id: int
+    item_id: int
+    result: ReviewResult
+    comment: Optional[str] = None
+    evidence_id: Optional[int] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class RectificationReviewOut(BaseModel):
+    id: int
+    case_id: int
+    decision: RectificationDecision
+    reviewer: str
+    comment: Optional[str] = None
+    created_at: datetime
+    revoked_at: Optional[datetime] = None
+    revoke_reason: Optional[str] = None
+    is_effective: bool
+    item_reviews: List[RectificationItemReviewOut] = []
+
+    class Config:
+        from_attributes = True
+
+
+class RectificationItemOut(BaseModel):
+    id: int
+    case_id: int
+    violation_key: str
+    violation_summary: Optional[str] = None
+    requirement: str
+    acceptance_criteria: Optional[str] = None
+    due_date: date
+    status: RectificationItemStatus
+    sort_order: int
+    current_evidence_id: Optional[int] = None
+    passed_at: Optional[datetime] = None
+    evidences: List[RectificationEvidenceOut] = []
+
+    class Config:
+        from_attributes = True
+
+
+class RectificationEventOut(BaseModel):
+    id: int
+    event_type: CaseEventType
+    detail: Optional[str] = None
+    actor: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class RectificationCaseOut(BaseModel):
+    id: int
+    case_no: str
+    institution_id: int
+    title: str
+    source_clue_id: Optional[int] = None
+    status: RectificationCaseStatus
+    score_item: ScoreItem
+    due_date: date
+    escalated: bool
+    escalated_at: Optional[datetime] = None
+    closed_at: Optional[datetime] = None
+    created_by: Optional[str] = None
+    created_at: datetime
+    items: List[RectificationItemOut] = []
+    reviews: List[RectificationReviewOut] = []
+    events: List[RectificationEventOut] = []
+
+    class Config:
+        from_attributes = True
+
+
+class ScoreAdjustmentOut(BaseModel):
+    id: int
+    institution_id: int
+    score_item: ScoreItem
+    adjustment_type: str
+    points: float
+    reason: str
+    case_id: Optional[int] = None
+    review_id: Optional[int] = None
+    violation_key: Optional[str] = None
+    status: str
+    effective_at: datetime
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ComplianceTraceRequirement(BaseModel):
+    item_id: int
+    requirement: str
+    acceptance_criteria: Optional[str] = None
+    due_date: date
+    item_status: RectificationItemStatus
+    current_evidence_version: Optional[int] = None
+    current_evidence_name: Optional[str] = None
+    last_review_result: Optional[ReviewResult] = None
+    last_review_comment: Optional[str] = None
+    last_reviewer: Optional[str] = None
+    last_review_at: Optional[datetime] = None
+    evidence_versions: List[RectificationEvidenceOut] = []
+
+
+class ComplianceTraceViolation(BaseModel):
+    violation_key: str
+    violation_summary: Optional[str] = None
+    clue_ids: List[int] = []
+    case_id: Optional[int] = None
+    case_no: Optional[str] = None
+    case_status: Optional[RectificationCaseStatus] = None
+    requirements: List[ComplianceTraceRequirement] = []
+    adjustments: List[ScoreAdjustmentOut] = []
+
+
+class ScoreHistoryEntry(BaseModel):
+    score_id: int
+    total_score: float
+    grade: ComplianceGrade
+    scored_at: datetime
+    scoring_period: Optional[str] = None
+    remark: Optional[str] = None
+    effective_adjustments: List[ScoreAdjustmentOut] = []
+    deduction_list: Optional[List[ScoreDeduction]] = None
+
+
+class InstitutionComplianceTrace(BaseModel):
+    institution_id: int
+    institution_name: str
+    latest_score: Optional[ComplianceScore] = None
+    violations: List[ComplianceTraceViolation] = []
+    score_history: List[ScoreHistoryEntry] = []

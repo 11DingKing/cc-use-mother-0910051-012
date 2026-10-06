@@ -141,3 +141,13 @@ def list_institution_authorized_procedures(institution_id: int, db: Session = De
         InstitutionAuthorizedProcedure.institution_id == institution_id
     ).all()
     return auths
+
+
+@router.get(
+    "/{institution_id}/compliance-trace",
+    response_model=schemas.InstitutionComplianceTrace,
+)
+def institution_compliance_trace(institution_id: int, db: Session = Depends(get_db)):
+    """合规追溯：当前分数 → 原违规线索 → 整改要求与证据版本 → 复核决定 → 历次评分与调整记录。"""
+    from ..rectification_service import build_compliance_trace
+    return build_compliance_trace(db, institution_id)
